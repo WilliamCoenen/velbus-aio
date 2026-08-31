@@ -199,8 +199,12 @@ def get_module_type_schema(type_id: int) -> dict[str, Any]:
     }
 
 
-async def get_module_instance_data(module: Module) -> dict[str, Any]:
+async def get_module_instance_data(
+    module: Module, *, refresh: bool = False
+) -> dict[str, Any]:
     """Return live module values for the config panel."""
+    if not refresh:
+        await module.ensure_panel_metadata_cache()
     channels = module.get_channels()
     channel_data: dict[str, Any] = {}
     for channel_num, channel in channels.items():
@@ -212,14 +216,14 @@ async def get_module_instance_data(module: Module) -> dict[str, Any]:
             hasattr(channel, "supports_channel_enable")
             and channel.supports_channel_enable()
         ):
-            entry["enabled"] = await channel.get_channel_enabled()
+            entry["enabled"] = await channel.get_channel_enabled(refresh=refresh)
         elif hasattr(channel, "is_enabled"):
             entry["enabled"] = channel.is_enabled()
         table = (
             channel.get_action_table() if hasattr(channel, "get_action_table") else None
         )
         if table is not None and table.noc_address is not None:
-            normal_closed = await channel.get_normal_closed()
+            normal_closed = await channel.get_normal_closed(refresh=refresh)
             if normal_closed is not None:
                 entry["contact"] = "NC" if normal_closed else "NO"
         channel_data[str(channel_num)] = entry

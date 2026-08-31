@@ -424,15 +424,7 @@ class _SharedSlotStore:
         self._log = logger
         self.slots: list[ActionSlot] | None = None
 
-    async def load(self, *, force: bool = False) -> list[ActionSlot]:
-        if self.slots is not None and not force:
-            return self.slots
-        if force:
-            length = self.slot_count * self.slot_size
-            self.memory.invalidate(self.bank, self.bank + length - 1)
-            self.slots = None
-        length = self.slot_count * self.slot_size
-        raw = await self.memory.read_bytes(self.bank, length, use_cache=not force)
+    def _decode_slots(self, raw: bytes) -> list[ActionSlot]:
         slots: list[ActionSlot] = []
         for slot in range(self.slot_count):
             offset = slot * self.slot_size
@@ -446,8 +438,36 @@ class _SharedSlotStore:
                     release_bit=self.release_bit,
                 )
             )
-        self.slots = slots
         return slots
+
+    def decode_from_cache(self) -> bool:
+        """Decode slots from the shadow EEPROM cache without bus access."""
+        if self.slots is not None:
+            return True
+        length = self.slot_count * self.slot_size
+        raw = self.memory.get_cached_range(self.bank, length)
+        if raw is None:
+            return False
+        self.slots = self._decode_slots(raw)
+        return True
+
+    async def load(
+        self, *, force: bool = False, prefetch: bool = False
+    ) -> list[ActionSlot]:
+        if self.slots is not None and not force:
+            return self.slots
+        if not force and self.decode_from_cache():
+            return self.slots
+        if force:
+            length = self.slot_count * self.slot_size
+            self.memory.invalidate(self.bank, self.bank + length - 1)
+            self.slots = None
+        length = self.slot_count * self.slot_size
+        raw = await self.memory.read_bytes(
+            self.bank, length, use_cache=not force, prefetch=prefetch
+        )
+        self.slots = self._decode_slots(raw)
+        return self.slots
 
     def slot_address(self, slot: int) -> int:
         if slot < 0 or slot >= self.slot_count:
@@ -521,6 +541,48 @@ class ActionTable:
             return self._shared.slots is not None
         return self._slots is not None
 
+    @property
+    def shared_store(self) -> _SharedSlotStore | None:
+        """Return the shared slot store, if this table uses one."""
+        return self._shared
+
+    def clear_decoded_cache(self) -> None:
+        """Drop decoded action-table state without clearing EEPROM bytes."""
+        self._slots = None
+        self._normal_closed = None
+
+    def decode_from_cache(self) -> bool:
+        """Decode this table from the shadow EEPROM cache without bus access."""
+        if self.loaded:
+            return True
+        if self._shared is not None:
+            if not self._shared.decode_from_cache():
+                return False
+        else:
+            length = self.slot_count * self.slot_size
+            raw = self._memory.get_cached_range(self.bank, length)
+            if raw is None:
+                return False
+            slots: list[ActionSlot] = []
+            for slot in range(self.slot_count):
+                offset = slot * self.slot_size
+                slots.append(
+                    ActionSlot.from_bytes(
+                        slot,
+                        raw[offset : offset + self.slot_size],
+                        self.catalog_id,
+                        slot_size=self.slot_size,
+                        subject_encoding=self.subject_encoding,
+                        release_bit=self.release_bit,
+                    )
+                )
+            self._slots = slots
+        if self.noc_address is not None:
+            cached = self._memory.get_cached(self.noc_address)
+            if cached is not None:
+                self._normal_closed = cached == 0x00
+        return True
+
     def _slot_address(self, slot: int) -> int:
         if self._shared is not None:
             return self._shared.slot_address(slot)
@@ -530,19 +592,25 @@ class ActionTable:
             )
         return self.bank + (slot * self.slot_size)
 
-    async def load(self, *, force: bool = False) -> list[ActionSlot]:
+    async def load(
+        self, *, force: bool = False, prefetch: bool = False
+    ) -> list[ActionSlot]:
         """Read all slots from module memory."""
         if force:
             length = self.slot_count * self.slot_size
             self._memory.invalidate(self.bank, self.bank + length - 1)
             self._slots = None
+        elif self.decode_from_cache():
+            return self.get_slots(include_empty=True)
         if self._shared is not None:
-            slots = await self._shared.load(force=force)
+            slots = await self._shared.load(force=force, prefetch=prefetch)
         elif self._slots is not None and not force:
             slots = self._slots
         else:
             length = self.slot_count * self.slot_size
-            raw = await self._memory.read_bytes(self.bank, length, use_cache=not force)
+            raw = await self._memory.read_bytes(
+                self.bank, length, use_cache=not force, prefetch=prefetch
+            )
             slots = []
             for slot in range(self.slot_count):
                 offset = slot * self.slot_size
@@ -558,8 +626,10 @@ class ActionTable:
                 )
             self._slots = slots
 
-        if self.noc_address is not None:
-            value = await self._memory.read_byte(self.noc_address, use_cache=not force)
+        if self.noc_address is not None and (force or self._normal_closed is None):
+            value = await self._memory.read_byte(
+                self.noc_address, use_cache=not force, prefetch=prefetch
+            )
             self._normal_closed = value == 0x00
 
         return list(slots)
@@ -590,8 +660,37 @@ class ActionTable:
         self, *, refresh: bool = False, include_empty: bool = False
     ) -> list[ActionSlot]:
         """Load if needed and return slots for this channel."""
-        await self.load(force=refresh)
+        if refresh:
+            await self.load(force=True)
+        elif not self.loaded and not self.decode_from_cache():
+            await self.load(force=False)
         return self.get_slots(include_empty=include_empty)
+
+    async def load_noc(self, *, refresh: bool = False, prefetch: bool = False) -> None:
+        """Load only the NO/NC contact byte for this channel."""
+        if self.noc_address is None:
+            return
+        if self._normal_closed is not None and not refresh:
+            return
+        value = await self._memory.read_byte(
+            self.noc_address, use_cache=not refresh, prefetch=prefetch
+        )
+        self._normal_closed = value == 0x00
+
+    async def get_normal_closed(self, *, refresh: bool = False) -> bool | None:
+        """Return True when the relay contact is programmed as NC."""
+        if self.noc_address is None:
+            return None
+        if self._normal_closed is not None and not refresh:
+            return self._normal_closed
+        if not refresh:
+            cached = self._memory.get_cached(self.noc_address)
+            if cached is not None:
+                self._normal_closed = cached == 0x00
+                return self._normal_closed
+        value = await self._memory.read_byte(self.noc_address, use_cache=not refresh)
+        self._normal_closed = value == 0x00
+        return self._normal_closed
 
     def find_free_slot(self) -> int:
         """Return the first unused slot index in the backing table."""
@@ -687,16 +786,6 @@ class ActionTable:
                 continue
             cleared.append(await self.clear_action(entry.slot))
         return cleared
-
-    async def get_normal_closed(self, *, refresh: bool = False) -> bool | None:
-        """Return True when the relay contact is programmed as NC."""
-        if self.noc_address is None:
-            return None
-        if self._normal_closed is not None and not refresh:
-            return self._normal_closed
-        value = await self._memory.read_byte(self.noc_address, use_cache=not refresh)
-        self._normal_closed = value == 0x00
-        return self._normal_closed
 
     async def set_normal_closed(self, normal_closed: bool) -> None:
         """Program NO (False) or NC (True) contact behaviour."""

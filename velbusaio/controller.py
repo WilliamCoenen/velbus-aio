@@ -30,6 +30,7 @@ from velbusaio.config import ConfigParameter
 from velbusaio.exceptions import VelbusConnectionFailed
 from velbusaio.handler import PacketHandler
 from velbusaio.helpers import get_cache_dir
+from velbusaio.memory_prefetch import MemoryAccessCoordinator
 from velbusaio.message import Message
 from velbusaio.messages.module_type_request import ModuleTypeRequestMessage
 from velbusaio.messages.set_date import SetDate
@@ -114,6 +115,22 @@ class Velbus:
         self._background_tasks: set[asyncio.Task] = set()
         self._scheduled_tasks: dict[str, ScheduledTask] = {}
         self._scheduler_log = logging.getLogger("velbus-scheduler")
+        self._memory_coordinator = MemoryAccessCoordinator(self)
+        self._had_modules_before_connect = False
+
+    def get_memory_access_coordinator(self) -> MemoryAccessCoordinator:
+        """Return the shared memory access coordinator."""
+        return self._memory_coordinator
+
+    def add_background_task(self, task: asyncio.Task) -> None:
+        """Keep a background task referenced until it completes."""
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    @property
+    def memory_prefetch_in_progress(self) -> bool:
+        """Return True while EEPROM prefetch is running in the background."""
+        return self._memory_coordinator.prefetch_in_progress
 
     def add_connect_callback(self, meth: t.Callable[[], Awaitable[None]]) -> None:
         """Register a coroutine to be called on connect."""
@@ -173,19 +190,30 @@ class Velbus:
         """Respond to Protocol connection state changes."""
         self._is_connected = is_connected
         if is_connected:
+            if self._had_modules_before_connect:
+                self._invalidate_all_memory_caches()
+                self._memory_coordinator.bump_generation()
+                self._memory_coordinator.schedule_prefetch()
+            self._had_modules_before_connect = bool(self._modules)
             for callback in self._on_connect_callbacks:
                 await callback()
         else:
+            self._memory_coordinator.cancel_prefetch()
+            self._had_modules_before_connect = bool(self._modules)
             for callback in self._on_disconnect_callbacks:
                 await callback()
             if self._auto_reconnect and not self._closing:
                 self._log.debug("Reconnecting to transport")
                 task = asyncio.ensure_future(self._reconnect_loop())
-                self._background_tasks.add(task)
-                task.add_done_callback(self._background_tasks.discard)
+                self.add_background_task(task)
         for mod in self._modules.values():
             for chan in mod.get_channels().values():
                 await chan.status_update()
+
+    def _invalidate_all_memory_caches(self) -> None:
+        """Drop EEPROM caches for every known module."""
+        for module in self._modules.values():
+            module.invalidate_config_memory_cache()
 
     def get_cache_dir(self) -> str:
         """Return the cache directory."""
@@ -255,6 +283,7 @@ class Velbus:
         """Stop the controller."""
         self._closing = True
         self._auto_reconnect = False
+        self._memory_coordinator.cancel_prefetch()
         # Stop all scheduled tasks
         for task in self._scheduled_tasks.values():
             task.stop()
@@ -361,10 +390,13 @@ class Velbus:
             await anyio.Path(self._cache_dir).mkdir(parents=True, exist_ok=True)
             # scan the bus
             await self._handler.scan()
+        self._memory_coordinator.schedule_prefetch()
 
     async def scan(self) -> None:
         """Service endpoint to restart the scan."""
         await self._handler.scan(True)
+        self._memory_coordinator.bump_generation()
+        self._memory_coordinator.schedule_prefetch()
 
     async def sendTypeRequestMessage(self, address: int) -> None:
         """Send a module type request message."""

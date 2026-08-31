@@ -436,6 +436,14 @@ class Button(Channel):
         memory = self._module.get_memory()
         if memory is None:
             return self._enabled
+        if not refresh:
+            cached = memory.get_cached(spec["address"])
+            if cached is not None:
+                enabled = cached != spec["disabled_value"]
+                if enabled:
+                    self._saved_reaction_time = cached
+                self._enabled = enabled
+                return enabled
         value = await memory.read_byte(spec["address"], use_cache=not refresh)
         enabled = value != spec["disabled_value"]
         if enabled:
