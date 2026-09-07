@@ -645,11 +645,11 @@ class ButtonCounter(Button):
         return self._rate_from_pulse_interval()
 
     def get_unit(self) -> str | None:
-        """Return the unit of the instantaneous value."""
+        """Return the unit of the counter."""
         if self._Unit == VOLUME_LITERS_HOUR:
-            return "L/h"
+            return "L"
         if self._Unit == VOLUME_CUBIC_METER_HOUR:
-            return "m³/h"
+            return "m3"
         if self._Unit == ENERGY_KILO_WATT_HOUR:
             return "W"
         return None
