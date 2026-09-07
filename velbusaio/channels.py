@@ -645,11 +645,11 @@ class ButtonCounter(Button):
         return self._rate_from_pulse_interval()
 
     def get_unit(self) -> str | None:
-        """Return the unit of the counter."""
+        """Return the unit of the instantaneous value."""
         if self._Unit == VOLUME_LITERS_HOUR:
-            return "L"
+            return "L/h"
         if self._Unit == VOLUME_CUBIC_METER_HOUR:
-            return "m3"
+            return "m³/h"
         if self._Unit == ENERGY_KILO_WATT_HOUR:
             return "W"
         return None
@@ -676,6 +676,14 @@ class ButtonCounter(Button):
     def is_water(self) -> bool:
         """Return if this channel is a water channel."""
         return bool(self._counter and self._Unit == VOLUME_LITERS_HOUR)
+
+    def is_gas(self) -> bool:
+        """Return if this channel is a gas channel."""
+        return bool(self._counter and self._Unit == VOLUME_CUBIC_METER_HOUR)
+
+    def is_electricity(self) -> bool:
+        """Return if this channel is an electricity channel."""
+        return self._Unit == ENERGY_KILO_WATT_HOUR
 
 
 class Sensor(Button):
