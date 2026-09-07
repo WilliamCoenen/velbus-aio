@@ -241,6 +241,29 @@ class TestButtonCounter:
         button._Unit = ENERGY_KILO_WATT_HOUR
         assert not button.is_water()
 
+    def test_is_gas(self, mock_module, mock_writer):
+        """Test checking if counter is gas meter."""
+        button = ButtonCounter(
+            mock_module, 1, "Counter", False, True, mock_writer, 0x01
+        )
+        button._counter = 100
+        button._Unit = VOLUME_CUBIC_METER_HOUR
+        assert button.is_gas()
+
+        button._Unit = ENERGY_KILO_WATT_HOUR
+        assert not button.is_gas()
+
+    def test_is_electricity(self, mock_module, mock_writer):
+        """Test checking if counter is electricity meter."""
+        button = ButtonCounter(
+            mock_module, 1, "Counter", False, True, mock_writer, 0x01
+        )
+        button._Unit = ENERGY_KILO_WATT_HOUR
+        assert button.is_electricity()
+
+        button._Unit = VOLUME_LITERS_HOUR
+        assert not button.is_electricity()
+
     def test_energy_from_energy_field(self, mock_module, mock_writer):
         """Test energy property returns kWh from _energy field (Wh)."""
         button = ButtonCounter(
